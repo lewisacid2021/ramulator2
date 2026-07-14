@@ -36,7 +36,21 @@ public:
     TranslationTable* translation_table() { return m_tt; }
     double get_window_rcr() const { return m_window_rcr; }
     int get_current_t() const { return m_t_current; }
+    // Selection bridge: number of rows currently queued for compaction.
+    // Exposed for tests + e2e gates. Production reads m_pending via
+    // gather phase drain; tests need to assert it advances from 0.
+    int get_pending_defrag_count() const { return m_pending_defrag_count; }
     void record_compaction_result(double savings, double cost);
+
+    // P0 Fix #1: select_defrag_candidates()
+    // Bridges Monitor → Decide. Iterates m_row_access_count from the
+    // just-closed window and pushes rows exceeding the hotness threshold
+    // into m_pending. Called at the window boundary inside tick().
+    //
+    // NOTE: this is SELECTION (which rows to defrag), not ROUTING. The
+    // routing topology (k_hot bank groups per channel) is independent
+    // and unchanged.
+    void select_defrag_candidates();
     // CGBC sink routing (Task 14): pick channel/bank for an evacuation sink.
     // NOTE(brief-deviation): brief's verbatim code uses CH_SHIFT=16, but the
     // accompanying test asserts `(sink >> 8) % 8 == channel`, which requires

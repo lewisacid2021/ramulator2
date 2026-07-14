@@ -1,6 +1,7 @@
 #include "dram_controller/controller.h"
 #include "dram_controller/Controller_MDGE.h"
 #include "memory_system/memory_system.h"
+#include "addr_mapper/addr_mapper.h"
 
 #include <memory>
 
@@ -451,6 +452,18 @@ protected:
   std::string get_ifce_name() const override { return m_ifce_name; }
 
 public:
+  // P0 Fix #1d: capture the address mapper so we can populate addr_vec
+  // for background gather/evacuate requests. Without this, those
+  // requests reach schedule_request() with an empty addr_vec and crash
+  // (check_ready dereferences it). The foreground path is unaffected
+  // because GenericDRAMSystem::send() applies the mapper before
+  // dispatching to the channel controller.
+  IAddrMapper* m_addr_mapper = nullptr;
+
+  void setup(IFrontEnd* frontend, IMemorySystem* memory_system) override {
+    GenericDRAMController::setup(frontend, memory_system);
+    m_addr_mapper = memory_system->get_ifce<IAddrMapper>();
+  }
   // Constructor: forward to GenericDRAMController(config, parent), then
   // do the macro's post-construction housekeeping (m_impl binding, param
   // group registration, init() invocation).
@@ -531,6 +544,11 @@ public:
       // the next tick try again — acceptable for first-pass smoke test.
       Request bg(0, (int)Request::Type::Read);
       while (m_mdge->defrag_queue()->dequeue(bg)) {
+        // P0 Fix #1d: apply addr_mapper so addr_vec is populated before
+        // schedule_request dereferences it. Foreground requests get this
+        // for free from GenericDRAMSystem::send(); BG requests bypass
+        // that path because they're injected from the controller.
+        if (m_addr_mapper) m_addr_mapper->apply(bg);
         bool ok = GenericDRAMController::send(bg);
         if (!ok) break;
         // Re-prime `bg` before the next iteration: Request has no default
