@@ -87,7 +87,24 @@ void Controller_MDGE::tick(uint64_t cycle) {
     if (m_state == MDGEState::GATHER) {
         if (m_gather_expected == 0) {
             // First tick in GATHER: enqueue reads and remember expected count.
+            //
+            // 5th dead-code gate fix: GATHER→EVACUATE previously saw an
+            // empty m_evacuate_targets (no production code populated it),
+            // so EVACUATE issued zero WRITEs and never inserted into
+            // TranslationTable. Fix: while m_pending is still alive, route
+            // each (orig_addr, head_id) through CGBC sink computation
+            // using the window_id captured on this boundary tick, then
+            // push the (orig_addr, sink_addr) pair into m_evacuate_targets.
+            // m_pending.clear() is moved to AFTER the routing loop so
+            // we never dereference a cleared vector.
+            m_gather_window_id = (m_cfg.window_size > 0)
+                ? (int)(cycle / (uint64_t)m_cfg.window_size)
+                : 0;
             for (auto& p : m_pending) {
+                uint64_t sink_addr = compute_cgbc_sink(
+                    p.orig_addr, p.head_id, m_gather_window_id);
+                add_evacuate_target({.orig_addr = p.orig_addr,
+                                    .sink_addr = sink_addr});
                 Request r(p.orig_addr, (int)Request::Type::Read);
                 m_defrag_q.enqueue(r, Priority::BACKGROUND);
                 m_gather_expected++;

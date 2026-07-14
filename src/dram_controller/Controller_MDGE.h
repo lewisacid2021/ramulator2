@@ -91,9 +91,13 @@ private:
     int m_pending_defrag_count = 0;
     int m_decode_idle_cycles = 0;
 
-    // Gather phase (Task 12): pending rows + expected gather counter
+    // Gather phase (Task 12): pending rows + expected gather counter.
+    // m_gather_window_id is captured on first entry to GATHER and used to
+    // key compute_cgbc_sink() for every (orig_addr → sink_addr) routing
+    // decision in this gather phase. Derivation: cycle / cfg.window_size.
     std::vector<PendingDefrag> m_pending;
     int m_gather_expected = 0;  // expected drains before EVACUATE
+    int m_gather_window_id = 0;  // captured at gather entry (5th gate fix)
 
     // Evacuate phase (Task 13): orig→sink targets and completed evacs
     std::vector<EvacuateTarget> m_evacuate_targets;
