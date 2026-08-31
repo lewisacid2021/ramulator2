@@ -9,11 +9,6 @@ target_sources(
   plugin.h
   refresh.h
   rowpolicy.h
-  Controller_MDGE.h
-  RequestQueue_DeFrag.h
-
-  Controller_MDGE.cpp
-  RequestQueue_DeFrag.cpp
 
   impl/bh_dram_controller.cpp
   impl/dummy_controller.cpp
