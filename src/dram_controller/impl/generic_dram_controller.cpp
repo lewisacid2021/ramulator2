@@ -501,6 +501,12 @@ public:
     // in parallel and accumulates its own global/per-bank cycle counters.
     // See CLAUDE.md §6 "DDR-mode row_miss 与 PIM-mode row_miss 不是同一 metric".
     void finalize() override {
+        // Phase 2 metric-gap fix (2026-09-01): LoadStoreTrace ends the sim
+        // as soon as the trace is drained — with short traces the PIM
+        // program would only partially execute and pim_* metrics would
+        // silently reflect a truncated prefix. Drain the remaining program
+        // here so metrics cover the full program.
+        drain_program();
         finalize_pim_stats();
         // We deliberately do NOT call GenericDRAMController::finalize() —
         // the parent's finalize() recomputes s_avg_read_latency / queue_len
@@ -511,79 +517,104 @@ public:
     }
 
     void tick() override {
+        // Phase 2 metric-gap fix (2026-09-01): one PIM instruction per
+        // controller tick; the base DRAM controller services trace
+        // requests in parallel.
         if (!m_program.empty() && m_pc < m_program.size()) {
-            const auto& inst = m_program[m_pc];
-            switch (static_cast<PIMOpcode>(inst.opcode)) {
-            case PIMOpcode::LOAD_Q: {
-                // Phase 2 (2026-08-31): LOAD_Q is "Q into staging buffer"
-                // — purely in-DRAM data movement, no DRAM bus request.
-                // Sending through GenericDRAMController::send() segfaults
-                // because the read never completes (no callback wired
-                // for PIM-issued requests).
-                m_global_cycles += LOAD_Q_CYCLES;
-                break;
-            }
-            case PIMOpcode::MATMUL_QK: {
-                // Phase 2 (2026-08-31): K is held in bank row buffer; MAC
-                // computes in-situ. No DRAM read issued — this is THE
-                // PIM bandwidth claim (Qwen2-7B 4K: 113 MB → 896 KB).
-                // Timing cost still tracks row buffer hits/misses via
-                // m_per_bank_open_row, so the wall-clock cycles reflect
-                // what real PIM hardware would incur.
-                for (uint32_t i = 0; i < inst.seq_len; ++i) {
-                    uint64_t row_addr = inst.src_addr + uint64_t(i) * m_head_dim * m_bytes_per_element;
-                    auto [ch, bk, row] = pim_addr_to_phys(row_addr, m_ddr_row_bytes);
-                    int bank_id = ch * m_num_banks + bk;
-                    uint64_t cost = (m_per_bank_open_row[bank_id].has_value() &&
-                                     m_per_bank_open_row[bank_id].value() == row)
-                                    ? ROW_HIT_CYCLES : ROW_MISS_CYCLES;
-                    m_per_bank_open_row[bank_id] = row;
-                    m_per_bank_cycles[bank_id] += cost;
-                }
-                break;
-            }
-            case PIMOpcode::SOFTMAX: {
-                m_global_cycles += SOFTMAX_PER_TOKEN * inst.seq_len;
-                break;
-            }
-            case PIMOpcode::MATMUL_SV: {
-                // Phase 2 (2026-08-31): V is also held in bank row buffer.
-                // The original implementation issued a DRAM read per token,
-                // which both contradicted the PIM bandwidth claim AND
-                // crashed with 458752 Request enqueues × 8 channels.
-                for (uint32_t i = 0; i < inst.seq_len; ++i) {
-                    m_per_bank_cycles[inst.bank_id] += ROW_HIT_CYCLES;
-                }
-                break;
-            }
-            case PIMOpcode::STORE: {
-                // Phase 2 (2026-08-31): same reasoning as LOAD_Q. Results
-                // are written back to DRAM but the write request must
-                // originate from the per-bank compute unit, not the base
-                // request queue (which expects trace-driven writes with
-                // completion callbacks).
-                m_global_cycles += STORE_CYCLES;
-                break;
-            }
-            case PIMOpcode::SYNC: {
-                uint64_t max_cyc = 0;
-                for (auto& [b, c] : m_per_bank_cycles) max_cyc = std::max(max_cyc, c);
-                for (auto& [b, c] : m_per_bank_cycles) c = max_cyc;
-                m_global_cycles += SYNC_CYCLES;
-                break;
-            }
-            case PIMOpcode::FINISH: {
-                m_global_cycles += FINISH_CYCLES;
-                break;
-            }
-            case PIMOpcode::NOP: {
-                m_global_cycles += NOP_CYCLES;
-                break;
-            }
-            }
-            ++m_pc;
+            step_program();
         }
         GenericDRAMController::tick();
+    }
+
+    // Phase 2 metric-gap fix (2026-09-01): execute the instruction at m_pc
+    // and advance. Extracted from tick() so finalize() can drain a program
+    // whose execution outlived a short trace (LoadStoreTrace::is_finished()
+    // ends the sim when the trace is drained, not when PIM work is done).
+    void step_program() {
+        const auto& inst = m_program[m_pc];
+        switch (static_cast<PIMOpcode>(inst.opcode)) {
+        case PIMOpcode::LOAD_Q: {
+            // Phase 2 (2026-08-31): LOAD_Q is "Q into staging buffer"
+            // — purely in-DRAM data movement, no DRAM bus request.
+            // Sending through GenericDRAMController::send() segfaults
+            // because the read never completes (no callback wired
+            // for PIM-issued requests).
+            m_global_cycles += LOAD_Q_CYCLES;
+            break;
+        }
+        case PIMOpcode::MATMUL_QK: {
+            // Phase 2 (2026-08-31): K is held in bank row buffer; MAC
+            // computes in-situ. No DRAM read issued — this is THE
+            // PIM bandwidth claim (Qwen2-7B 4K: 113 MB → 896 KB).
+            // Timing cost still tracks row buffer hits/misses via
+            // m_per_bank_open_row, so the wall-clock cycles reflect
+            // what real PIM hardware would incur.
+            for (uint32_t i = 0; i < inst.seq_len; ++i) {
+                uint64_t row_addr = inst.src_addr + uint64_t(i) * m_head_dim * m_bytes_per_element;
+                auto [ch, bk, row] = pim_addr_to_phys(row_addr, m_ddr_row_bytes);
+                int bank_id = ch * m_num_banks + bk;
+                bool hit = m_per_bank_open_row[bank_id].has_value() &&
+                           m_per_bank_open_row[bank_id].value() == row;
+                // 2026-09-01 (Phase 2 metric-gap fix): MATMUL_QK hit/miss
+                // counts — the layout-sensitive PIM-mode metric. With
+                // block-wise instructions (pim.scheduler.k_layouts) these
+                // distinguish DeFrag vs naive K layouts (sparse ratio
+                // ~12.4x); matches pim.sim.matmul_qk_sim ground truth.
+                if (hit) { m_matmul_qk_hits += 1; } else { m_matmul_qk_misses += 1; }
+                uint64_t cost = hit ? ROW_HIT_CYCLES : ROW_MISS_CYCLES;
+                m_per_bank_open_row[bank_id] = row;
+                m_per_bank_cycles[bank_id] += cost;
+            }
+            break;
+        }
+        case PIMOpcode::SOFTMAX: {
+            m_global_cycles += SOFTMAX_PER_TOKEN * inst.seq_len;
+            break;
+        }
+        case PIMOpcode::MATMUL_SV: {
+            // Phase 2 (2026-08-31): V is also held in bank row buffer.
+            // The original implementation issued a DRAM read per token,
+            // which both contradicted the PIM bandwidth claim AND
+            // crashed with 458752 Request enqueues × 8 channels.
+            for (uint32_t i = 0; i < inst.seq_len; ++i) {
+                m_per_bank_cycles[inst.bank_id] += ROW_HIT_CYCLES;
+            }
+            break;
+        }
+        case PIMOpcode::STORE: {
+            // Phase 2 (2026-08-31): same reasoning as LOAD_Q. Results
+            // are written back to DRAM but the write request must
+            // originate from the per-bank compute unit, not the base
+            // request queue (which expects trace-driven writes with
+            // completion callbacks).
+            m_global_cycles += STORE_CYCLES;
+            break;
+        }
+        case PIMOpcode::SYNC: {
+            uint64_t max_cyc = 0;
+            for (auto& [b, c] : m_per_bank_cycles) max_cyc = std::max(max_cyc, c);
+            for (auto& [b, c] : m_per_bank_cycles) c = max_cyc;
+            m_global_cycles += SYNC_CYCLES;
+            break;
+        }
+        case PIMOpcode::FINISH: {
+            m_global_cycles += FINISH_CYCLES;
+            break;
+        }
+        case PIMOpcode::NOP: {
+            m_global_cycles += NOP_CYCLES;
+            break;
+        }
+        }
+        ++m_pc;
+    }
+
+    // Phase 2 metric-gap fix (2026-09-01): run the program to completion.
+    // Called from finalize() when a short trace ended the sim early.
+    void drain_program() {
+        while (!m_program.empty() && !program_finished()) {
+            step_program();
+        }
     }
 
     void load_program(const std::vector<uint8_t>& program_bytes) {
@@ -628,6 +659,10 @@ private:
                     static_cast<unsigned long>(m_global_cycles));
         std::printf("    pim_per_bank_max_cycles: %lu\n",
                     static_cast<unsigned long>(per_bank_max_cycles()));
+        std::printf("    pim_matmul_qk_hits: %lu\n",
+                    static_cast<unsigned long>(m_matmul_qk_hits));
+        std::printf("    pim_matmul_qk_misses: %lu\n",
+                    static_cast<unsigned long>(m_matmul_qk_misses));
         std::printf("    pim_program_steps: %zu\n", m_program.size());
         std::fflush(stdout);
     }
@@ -674,6 +709,11 @@ private:
     std::vector<PIMInstruction> m_program;
     size_t m_pc = 0;
     uint64_t m_global_cycles = 0;
+    // 2026-09-01 (Phase 2 metric-gap fix): layout-sensitive MATMUL_QK row
+    // buffer counters (vs layout-static pim_per_bank_max_cycles under the
+    // legacy single-sweep programs).
+    uint64_t m_matmul_qk_hits = 0;
+    uint64_t m_matmul_qk_misses = 0;
     std::unordered_map<int, uint64_t> m_per_bank_cycles;
     std::unordered_map<int, std::optional<int>> m_per_bank_open_row;
 
